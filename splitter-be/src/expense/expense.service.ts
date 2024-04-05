@@ -4,7 +4,7 @@ import {
   ProportionalDebtDataDTO,
   UpdateExpenseDTO,
 } from './dto';
-import { Distribution, Expense, ExpenseCategory } from '@prisma/client';
+import { Currency, Distribution, Expense, ExpenseCategory } from '@prisma/client';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { PrismaClientKnownRequestError } from '@prisma/client/runtime/library';
 
@@ -15,42 +15,7 @@ export class ExpenseService {
 
   async create(dto: CreateExpenseDTO) {
     try {
-      let createDebtsData = [];
-      if (dto.distributionType && dto.distributionType === Distribution.exact_amounts) {
-        dto.exactAmountsDebtData.map((data) => {
-          createDebtsData.push({
-            userId: data.payerId,
-            amount: data.exactAmount,
-            currency: dto.currency,
-          });
-        });
-      } else if (
-        dto.distributionType &&
-        dto.distributionType === Distribution.proportional
-      ) {
-        dto.proportionalDebtsData.map((data: ProportionalDebtDataDTO) => {
-          createDebtsData.push({
-            userId: data.userId,
-            amount: (dto.amount * data.percent) / 100,
-            currency: dto.currency,
-          });
-        });
-      } else {
-        dto.userIds.map((userId) => {
-          createDebtsData.push({
-            userId,
-            amount: dto.amount / dto.userIds.length,
-            currency: dto.currency,
-          });
-        });
-      }
-      const isEqual= isSumEqualToValue(
-        createDebtsData.map((data) => data.amount),
-        dto.amount,
-      )
-      if (!isEqual) { 
-        throw new Error('Sum of debt amounts and the amount of expense differ');
-      }
+      let debtsData = createDebtsData(dto);
 
       const expense = await this.prismaService.expense.create({
         data: {
@@ -72,7 +37,7 @@ export class ExpenseService {
           },
           debts: {
             createMany: {
-              data: createDebtsData.map((debt) => ({
+              data: debtsData.map((debt) => ({
                 amount: debt.amount,
                 currency2: debt.currency,
                 userId: debt.userId,
@@ -143,17 +108,17 @@ export class ExpenseService {
         where: {
           payerId: id,
         },
-        include:{
-          group:{
-            select:{
+        include: {
+          group: {
+            select: {
               name: true,
-              id: true
-            }
-          }
-        }
+              id: true,
+            },
+          },
+        },
       });
 
-      const filteredExpenses = expenses.map(expense=>{
+      const filteredExpenses = expenses.map((expense) => {
         return {
           id: expense.id,
           amount: expense.amount,
@@ -161,10 +126,10 @@ export class ExpenseService {
           distributionType: expense.distribution,
           group: {
             id: expense.group.id,
-            name: expense.group.name
-          }
-        }
-      })
+            name: expense.group.name,
+          },
+        };
+      });
       return filteredExpenses;
     } catch (error) {
       if (error instanceof PrismaClientKnownRequestError) {
@@ -218,19 +183,21 @@ export class ExpenseService {
           currency: unfilteredDebt.currency2,
           expenseId: unfilteredDebt.expenseId,
           name,
+          userId: unfilteredDebt.userId,
         };
       });
       return {
+        id: expense.id,
+        expenseName: expense.name,
         amount: expense.amount,
         category: expense.category,
         currency: expense.currency,
         description: expense.description,
-        expenseName: expense.name,
-        id: expense.id,
-        debts: filteredDebts,
+        distribution: expense.distribution,
         payerId: expense.payer.id,
         payerName,
-        distribution: expense.distribution,
+        groupId: expense.groupId,
+        debts: filteredDebts,
       };
     } catch (error) {
       if (error instanceof PrismaClientKnownRequestError) {
@@ -240,15 +207,67 @@ export class ExpenseService {
     }
   }
 
-  async update(id: number, updateExpenseDTO: UpdateExpenseDTO) {
+  async update(id: number, dto: UpdateExpenseDTO) {
     try {
-      const expense: Expense = await this.prismaService.expense.update({
+      let expense = await this.prismaService.expense.findUnique({
+        where:{
+          id
+        },
+        include:{
+          debts: true
+        }
+      })
+      let debtsData = createDebtsData(dto);
+
+      for(let debtData of debtsData){
+        const oldDebt = expense.debts.find(debt=>(debt.userId === debtData.userId));
+        if(oldDebt != null){
+          await this.prismaService.debt.update({
+            where:{
+              id: oldDebt.id
+            },
+            data: {
+              amount: debtData.amount,
+              currency2: debtData.currency,
+              user:{connect:{id: debtData.userId}}
+            }
+          })
+        }else{
+          await this.prismaService.debt.create({
+            data:{
+              amount: debtData.amount,
+              currency2: debtData.currency,
+              user:{connect:{id: debtData.userId}},
+              expense:{ connect: { id: expense.id } }
+            }
+          })
+        }
+      }
+
+      const remainingDebtUserIds = debtsData.map(debtdata=> debtdata.userId);
+      const deletedDebts = await this.prismaService.debt.deleteMany({
+        where:{
+          expenseId: expense.id,
+          AND:{NOT:{userId: {in: remainingDebtUserIds}}}
+        }
+      });
+      console.log("deleted debts: ", deletedDebts);
+      const updatedExpense: Expense = await this.prismaService.expense.update({
         where: {
           id,
         },
-        data: updateExpenseDTO,
+        data:{
+          name: dto.name,
+          amount: dto.amount,
+          currency: dto.currency,
+          category: dto.category,
+          distribution: dto.distributionType,
+          description: dto.description,
+          groupId: dto.groupId,
+          payerId: dto.payerId,
+        }
       });
-      return expense;
+      return updatedExpense;
     } catch (error) {
       if (error instanceof PrismaClientKnownRequestError) {
         throw new BadRequestException(error.code + error.message);
@@ -259,6 +278,13 @@ export class ExpenseService {
 
   async remove(id: number) {
     try {
+
+      await this.prismaService.debt.deleteMany({
+        where: {
+          expenseId: id,
+        },
+      });
+      
       const expense: Expense = await this.prismaService.expense.delete({
         where: {
           id: id,
@@ -275,37 +301,40 @@ export class ExpenseService {
 
   async getExpenseCategories() {
     try {
-      const categories = await this.prismaService.$queryRaw`SELECT enum_range(NULL::"ExpenseCategory") AS categories`;
-      
+      const categories = await this.prismaService
+        .$queryRaw`SELECT enum_range(NULL::"ExpenseCategory") AS categories`;
+
       return categories[0].categories;
     } catch (error) {
       // Handle errors appropriately
-      console.error('Error fetching category values:', error); 
+      console.error('Error fetching category values:', error);
       throw error;
     }
   }
 
   async getExpenseDistributions() {
     try {
-      const distributionTypes = await this.prismaService.$queryRaw`SELECT enum_range(NULL::"Distribution") AS distributiontypes`;
-      
+      const distributionTypes = await this.prismaService
+        .$queryRaw`SELECT enum_range(NULL::"Distribution") AS distributiontypes`;
+
       return distributionTypes[0].distributiontypes;
     } catch (error) {
       // Handle errors appropriately
-      console.error('Error fetching category values:', error); 
+      console.error('Error fetching category values:', error);
       throw error;
     }
   }
 
   async getCurrencies() {
     try {
-      const currencies = await this.prismaService.$queryRaw`SELECT enum_range(NULL::"Currency") AS currencies`;
+      const currencies = await this.prismaService
+        .$queryRaw`SELECT enum_range(NULL::"Currency") AS currencies`;
       console.log(currencies);
-      
+
       return currencies[0].currencies;
     } catch (error) {
       // Handle errors appropriately
-      console.error('Error fetching category values:', error); 
+      console.error('Error fetching category values:', error);
       throw error;
     }
   }
@@ -319,9 +348,54 @@ function isSumEqualToValue(array: number[], targetSum: number): boolean {
       return false;
     }
   }
-  console.log("targetSum:", targetSum); 
-  console.log("Sum:", sum);
+
+  console.log('array:', array);
+  console.log('targetSum:', targetSum);
+  console.log('Sum:', sum);
   const result = sum === targetSum;
-  console.log("result:", result);
+  console.log('result:', result);
   return result;
+}
+
+function createDebtsData(dto: UpdateExpenseDTO){
+  let debtsData = [];
+  if (
+    dto.distributionType &&
+    dto.distributionType === Distribution.exact_amounts
+  ) {
+    dto.exactAmountsDebtData.map((data) => {
+      debtsData.push({
+        userId: data.userId,
+        amount: data.amount,
+        currency: dto.currency,
+      });
+    });
+  } else if (
+    dto.distributionType &&
+    dto.distributionType === Distribution.proportional
+  ) {
+    dto.proportionalDebtsData.map((data: ProportionalDebtDataDTO) => {
+      debtsData.push({
+        userId: data.userId,
+        amount: (dto.amount * data.percent) / 100,
+        currency: dto.currency,
+      });
+    });
+  } else {
+    dto.userIds.map((userId) => {
+      debtsData.push({
+        userId,
+        amount: dto.amount / dto.userIds.length,
+        currency: dto.currency,
+      });
+    });
+  }
+  const isEqual = isSumEqualToValue(
+    debtsData.map((data) => data.amount),
+    dto.amount,
+  );
+  if (!isEqual) {
+    throw new Error('Sum of debt amounts and the amount of expense differ');
+  }
+  return debtsData;
 }

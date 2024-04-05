@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { ExpenseCategory, Group, User } from '@prisma/client';
 import { PrismaService } from 'src/prisma/prisma.service';
 import { AddOrRemoveUserDTO, CreateGroupDto, UpdateGroupDTO } from './dto';
+import { elementAt } from 'rxjs';
 
 @Injectable()
 export class GroupService {
@@ -31,9 +32,13 @@ export class GroupService {
       include: {
         members: true,
       },
-    });
 
-    return groups;
+    });
+    const filteredGroups = groups.map(group=>({
+      id: group.id,
+      groupName: group.name
+    }))
+    return filteredGroups;
   }
 
   async findAllByUserId(id: number) {
@@ -78,7 +83,6 @@ export class GroupService {
           debtsMap[debt.currency2] += debt.amount;
         });
       });
-      console.log('debtsMap:', debtsMap);
 
       //objektumba gyűjti
       for (const currency in debtsMap) {
@@ -89,7 +93,6 @@ export class GroupService {
           });
         }
       }
-      console.log('debtsByCurrencies: ', debtsByCurrencies);
 
       return { groupId, groupName, debtsByCurrencies };
     });
@@ -97,11 +100,25 @@ export class GroupService {
   }
 
   async findOne(id: number) {
-    return await this.prismaService.group.findUnique({
+    const group = await this.prismaService.group.findUnique({
       where: {
         id,
       },
+      include: {
+        members: {
+          select: {
+            id: true,
+            username: true,
+          },
+        },
+      },
     });
+    const filteredGroup = {
+      id: group.id,
+      name: group.name,
+      members: group.members,
+    };
+    return filteredGroup;
   }
 
   async getGroupDetails(id: number, userId: number) {
@@ -142,6 +159,217 @@ export class GroupService {
       },
     });
 
+    //-------------- bejelentkezett user mennyivel tartozik kinek ---------
+    //minden groupmember összes expense a groupban, benne a bejelentkezett tartozása
+    const expensesWithDebtsByUsers = await Promise.all(
+      groupDetails.members.map(async (member) => {
+        return await this.prismaService.expense.findMany({
+          where: {
+            payerId: member.id,
+            groupId: id,
+          },
+          include: {
+            debts: {
+              where: {
+                userId: userId,
+              },
+              include: {
+                user: {
+                  select: {
+                    id: true,
+                    username: true,
+                  },
+                },
+              },
+            },
+            payer: {
+              select: {
+                id: true,
+                username: true,
+              },
+            },
+          },
+        });
+      }),
+    );
+
+    //melyik groupMembernek mennyivel tartozom
+    const iOweToMembers = expensesWithDebtsByUsers
+      .map(
+        //egy user kiadásai
+        (expensesWithDebtsOfUser) => {
+          let debtsOfUsers: {
+            userId: number;
+            username: string;
+            sumDebtsByCurrencies: { sumAmount: number; currency: string }[];
+          }[] = [];
+
+          expensesWithDebtsOfUser.map(
+            //egy user egy kiadása
+            (expenseWithDebtsByUser) => {
+              const debt = expenseWithDebtsByUser.debts[0];
+              //csak egy lesz benne
+              if (debt) {
+                const index = debtsOfUsers.findIndex(
+                  (debtsOfUser) =>
+                    debtsOfUser.userId === expenseWithDebtsByUser.payerId,
+                );
+                if (index !== -1) {
+                  const currencyIndex = debtsOfUsers[
+                    index
+                  ].sumDebtsByCurrencies.findIndex(
+                    (subDebt) => subDebt.currency === debt.currency2,
+                  );
+                  if (currencyIndex !== -1) {
+                    debtsOfUsers[index].sumDebtsByCurrencies[
+                      currencyIndex
+                    ].sumAmount += debt.amount;
+                  } else {
+                    debtsOfUsers[index].sumDebtsByCurrencies.push({
+                      sumAmount: debt.amount,
+                      currency: debt.currency2,
+                    });
+                  }
+                } else {
+                  debtsOfUsers.push({
+                    userId: expenseWithDebtsByUser.payerId,
+                    username: expenseWithDebtsByUser.payer.username,
+                    sumDebtsByCurrencies: [
+                      { sumAmount: debt.amount, currency: debt.currency2 },
+                    ],
+                  });
+                }
+              }
+            },
+          );
+
+          return debtsOfUsers;
+        },
+      )
+      .flat();
+
+    //------------ melyik user mennyivel tartozik a bejelentkezett usernek ----------------
+    const myExpensesInGroup = (
+      await this.prismaService.expense.findMany({
+        where: {
+          payerId: userId,
+          groupId: id,
+        },
+        include: {
+          debts: {
+            include: {
+              user: {
+                select: {
+                  id: true,
+                  username: true,
+                },
+              },
+            },
+          },
+        },
+      })
+    ).map((myExpenseInGroup) => {
+      return {
+        id: myExpenseInGroup.id,
+        expenseName: myExpenseInGroup.name,
+        debts: myExpenseInGroup.debts.map((debt) => {
+          return {
+            userId: debt.user.id,
+            username: debt.user.username,
+            amount: debt.amount,
+            currency: debt.currency2,
+          };
+        }),
+      };
+    });
+
+    let membersOweMe: {
+      userId: number;
+      username: string;
+      sumDebtsByCurrencies: { sumAmount: number; currency: string }[];
+    }[] = [];
+
+    //kiszámolom, melyik user mennyivel tartozik
+    myExpensesInGroup.forEach((expense) => {
+      expense.debts.forEach((debt) => {
+        //benne van e már a tartozó a listában
+        const index = membersOweMe.findIndex(
+          (element) => element.userId === debt.userId,
+        );
+
+        if (index !== -1) {
+          //benne van, megnézzük, van-e már ilyen devizában bejegyzés
+          const currencyIndex = membersOweMe[
+            index
+          ].sumDebtsByCurrencies.findIndex(
+            (memberDebt) => memberDebt.currency === debt.currency,
+          );
+          if (currencyIndex !== -1) {
+            membersOweMe[index].sumDebtsByCurrencies[currencyIndex].sumAmount +=
+              debt.amount;
+          } else {
+            membersOweMe[index].sumDebtsByCurrencies.push({
+              sumAmount: debt.amount,
+              currency: debt.currency,
+            });
+          }
+        } else {
+          membersOweMe.push({
+            userId: debt.userId,
+            username: debt.username,
+            sumDebtsByCurrencies: [
+              { sumAmount: debt.amount, currency: debt.currency },
+            ],
+          });
+        }
+      });
+    });
+
+    //az én tartozásaim mindegyikét kivonom abból amennyivel nekem tartoznak
+    iOweToMembers.forEach((iOweToMember) => {
+      //tartozik-e nekem az, akinek én tartozom?
+      const index = membersOweMe.findIndex((memberOwesMe) => {
+        console.log('memberOwesMe userName?ó:', memberOwesMe.username);
+        console.log('memberOwesMe userName?ó:', iOweToMember.username);
+
+        return memberOwesMe.userId === iOweToMember.userId;
+      });
+      console.log('index: ', index);
+
+      if (index !== -1) {
+        iOweToMember.sumDebtsByCurrencies.forEach((mySumDebt) => {
+          const currencyIndex = membersOweMe[
+            index
+          ].sumDebtsByCurrencies.findIndex(
+            (memberSumDebt) => memberSumDebt.currency === mySumDebt.currency,
+          );
+          if (currencyIndex !== -1) {
+            membersOweMe[index].sumDebtsByCurrencies[currencyIndex].sumAmount -=
+              mySumDebt.sumAmount;
+            if (
+              membersOweMe[index].sumDebtsByCurrencies[currencyIndex]
+                .sumAmount === 0
+            ) {
+              membersOweMe[index].sumDebtsByCurrencies.splice(currencyIndex, 1);
+            }
+          } else {
+            membersOweMe[index].sumDebtsByCurrencies.push({
+              sumAmount: -mySumDebt.sumAmount,
+              currency: mySumDebt.currency,
+            });
+          }
+        });
+      } else {
+        membersOweMe.push({
+          userId: iOweToMember.userId,
+          username: iOweToMember.username,
+          sumDebtsByCurrencies: iOweToMember.sumDebtsByCurrencies.map(
+            (debt) => ({ sumAmount: -debt.sumAmount, currency: debt.currency }),
+          ),
+        });
+      }
+    });
+
     const filteredExpenses = groupDetails.expenses.map((expense) => {
       let payerName;
       if (expense.payer.firstName && expense.payer.lastName) {
@@ -168,7 +396,6 @@ export class GroupService {
         distribution: expense.distribution,
         debtAmount,
         payerName,
-        isUserInvolved,
       };
     });
 
@@ -177,6 +404,7 @@ export class GroupService {
       name: groupDetails.name,
       members: groupDetails.members,
       expenses: filteredExpenses,
+      balanceOfUser: membersOweMe,
     };
   }
 
@@ -202,8 +430,10 @@ export class GroupService {
   }
 
   async update(id: number, updateGroupDto: UpdateGroupDTO) {
+    console.log("in update group");
+    
     try {
-      const group: Group = await this.prismaService.group.update({
+      let group: Group = await this.prismaService.group.update({
         where: {
           id: id,
         },
@@ -211,6 +441,24 @@ export class GroupService {
           name: updateGroupDto.groupName,
         },
       });
+
+      console.log(updateGroupDto);
+      console.log(group);
+      
+
+      if (updateGroupDto.userIds.length > 0) {
+        group = await this.prismaService.group.update({
+          where: {
+            id: id,
+          },
+          data: {
+            members: {
+              connect: updateGroupDto.userIds.map((userId) => ({ id: userId })),
+            },
+          },
+        });
+      }
+
       return group;
     } catch (error) {
       throw error;
@@ -274,14 +522,39 @@ export class GroupService {
   }
 
   async remove(id: number) {
-    const group: Group = await this.prismaService.group.delete({
-      where: {
-        id: id,
-      },
+    await this.prismaService.$transaction(async (prisma) => {
+      const expenses = await prisma.expense.findMany({
+        where: {
+          groupId: id,
+        },
+        select: {
+          id: true,
+        },
+      });
+
+      for (const expense of expenses) {
+        await prisma.debt.deleteMany({
+          where: {
+            expenseId: expense.id,
+          },
+        });
+      }
+
+      await prisma.expense.deleteMany({
+        where: {
+          groupId: id,
+        },
+      });
+
+      await prisma.group.delete({
+        where: {
+          id: id,
+        },
+      });
     });
     return {
+      group: id,
       message: 'this group was deleted:',
-      group,
     };
   }
 }
